@@ -1,0 +1,55 @@
+spring:
+  # AWS RDS PostgreSQL Datasource Configurations
+  datasource:
+    url: jdbc:postgresql://${RDS_HOSTNAME:localhost}:${RDS_PORT:5432}/${RDS_DB_NAME:smartlivestock}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+      idle-timeout: 30000
+      max-lifetime: 1800000
+      connection-timeout: 20000
+
+  # JPA & Hibernate Settings
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: false
+        jdbc:
+          lob:
+            non_contextual_creation: true
+
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+
+jwt:
+  secret: ${JWT_SECRET}
+  expiration: 86400000
+
+  # AWS S3 Storage Configurations (future integration in S3 controller)
+  aws:
+    s3:
+      bucket-name: ${AWS_S3_BUCKET:smart-livestock-health-reports}
+      region: ${AWS_REGION:ap-south-1}
+      access-key: ${AWS_ACCESS_KEY}
+      secret-key: ${AWS_SECRET_KEY}
+
+# Cloud Logging Level management
+logging:
+  level:
+    root: INFO
+    org.springframework: WARN
+    com.smartlivestock.backend: INFO
+  file:
+    name: /var/log/smartlivestock/backend.log
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
