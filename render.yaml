@@ -5,12 +5,11 @@ version: "1"
 services:
   - type: web
     name: smart-livestock-backend
-    runtime: java
-    rootDir: backend
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
     plan: free
     region: oregon
-    buildCommand: mvn clean package -DskipTests
-    startCommand: java -jar target/backend-1.0.0.jar
     healthCheckPath: /api/v1/health
     envVars:
       - key: PORT
