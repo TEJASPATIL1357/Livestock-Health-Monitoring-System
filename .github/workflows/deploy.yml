@@ -1,0 +1,90 @@
+name: Java CI/CD Pipeline for Smart Livestock Backend
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  # =========================================================================
+  # JOB 1: BUILD AND TEST COMPILATION
+  # =========================================================================
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: maven
+
+    - name: Compile and Test with Maven
+      run: |
+        cd backend
+        mvn clean package -DskipTests
+
+    # Optional: Archive Compiled Artifact
+    - name: Upload Build Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: smartlivestock-backend-jar
+        path: backend/target/*.jar
+        retention-days: 1
+
+  # =========================================================================
+  # JOB 2: DEPLOY TO AWS EC2 CONTAINER/SERVICE
+  # =========================================================================
+  deploy:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+
+    steps:
+    - name: Download Build Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: smartlivestock-backend-jar
+        path: backend/target
+
+    - name: Deploy to AWS EC2 Instance via SSH/SCP
+      uses: appleboy/scp-action@v0.1.7
+      with:
+        host: ${{ secrets.AWS_EC2_HOST }}
+        username: ${{ secrets.AWS_EC2_USER }}
+        key: ${{ secrets.AWS_EC2_SSH_KEY }}
+        source: "backend/target/*.jar"
+        target: "/var/www/smartlivestock-deploy"
+        strip_components: 2
+
+    - name: Execute Remote SSH Deploy Commands
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.AWS_EC2_HOST }}
+        username: ${{ secrets.AWS_EC2_USER }}
+        key: ${{ secrets.AWS_EC2_SSH_KEY }}
+        script: |
+          echo "Stopping the existing background service..."
+          sudo systemctl stop smartlivestock.service || true
+          
+          echo "Copying the new JAR to production folder..."
+          sudo cp /var/www/smartlivestock-deploy/*.jar /var/www/smartlivestock/app.jar
+          
+          echo "Adjusting file ownership and execution permissions..."
+          sudo chown -R ubuntu:ubuntu /var/www/smartlivestock
+          sudo chmod +x /var/www/smartlivestock/app.jar
+          
+          echo "Restarting the systemd service daemon..."
+          sudo systemctl daemon-reload
+          sudo systemctl start smartlivestock.service
+          
+          echo "Checking service deployment status..."
+          sudo systemctl status smartlivestock.service --no-pager
+          
+          echo "Cleaning temporary deployment build files..."
+          rm -rf /var/www/smartlivestock-deploy/*
