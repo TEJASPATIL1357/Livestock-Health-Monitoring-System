@@ -31,13 +31,33 @@ yarn-error.*
 *.pem
 
 # local env files
+.env
 .env*.local
+!.env.example
+!.env.production.example
 
 # typescript
 *.tsbuildinfo
 
 example
 
-# generated native folders
-/ios
-/android
+# local secrets & firmware
+**/secrets.h
+secrets.h
+!firmware/**/secrets.h.example
+*_key.txt
+*key*.txt
+*.key
+*.dump
+backup_*
+scratch/
+
+# Maven & JVM build outputs
+target/
+**/target/
+*.class
+*.jar
+*.war
+.flattened-pom.xml
+
+
