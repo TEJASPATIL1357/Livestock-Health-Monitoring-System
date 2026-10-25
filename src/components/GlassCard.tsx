@@ -1,10 +1,10 @@
 import React from 'react';
-import { StyleSheet, View, ViewStyle, Pressable, Animated } from 'react-native';
+import { StyleSheet, View, ViewStyle, StyleProp, Pressable, Animated } from 'react-native';
 import { theme } from '../theme/theme';
 
 interface GlassCardProps {
   children: React.ReactNode;
-  style?: ViewStyle | ViewStyle[];
+  style?: StyleProp<ViewStyle>;
   onPress?: () => void;
   variant?: 'solid' | 'glass' | 'tinted';
   padding?: 'none' | 'sm' | 'md' | 'lg';

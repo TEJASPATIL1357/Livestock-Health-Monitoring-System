@@ -27,8 +27,8 @@ const STAGING_CONFIG: EnvironmentConfig = {
 
 const PROD_CONFIG: EnvironmentConfig = {
   env: 'production',
-  apiBaseUrl: 'https://api.smartlivestockhealth.com/v1',
-  wsBaseUrl: 'wss://api.smartlivestockhealth.com/ws',
+  apiBaseUrl: 'https://smart-livestock-backend-98l7.onrender.com/api/v1',
+  wsBaseUrl: 'wss://smart-livestock-backend-98l7.onrender.com/ws',
   enableAnalytics: true,
   enableOfflineCache: true,
   requestTimeoutMs: 10000,
@@ -83,9 +83,9 @@ export const formatApiUrl = (url?: string, defaultFallback = 'http://localhost:8
   }
   return trimmed;
 };
-
 const getEnv = (): EnvironmentConfig => {
-  const appEnv = process.env.EXPO_PUBLIC_APP_ENV || 'development';
+  const isDevMode = typeof __DEV__ !== 'undefined' ? __DEV__ : process.env.NODE_ENV !== 'production';
+  const appEnv = process.env.EXPO_PUBLIC_APP_ENV || (isDevMode ? 'development' : 'production');
   const customApiUrl = process.env.EXPO_PUBLIC_API_URL;
 
   switch (appEnv) {

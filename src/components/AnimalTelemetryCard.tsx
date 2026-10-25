@@ -185,6 +185,27 @@ export const AnimalTelemetryCard: React.FC<AnimalTelemetryCardProps> = ({
             </View>
           )}
         </View>
+
+        {telemetry?.movementAvailable && (telemetry.accelX !== undefined || telemetry.gyroX !== undefined) && (
+          <View style={styles.movementMetricsRow}>
+            {telemetry.accelX !== undefined && (
+              <View style={styles.metricPill}>
+                <AppText variant="caption" style={styles.metricLabel}>Accel (X/Y/Z)</AppText>
+                <AppText variant="caption" weight="bold" style={styles.metricValue}>
+                  {telemetry.accelX}, {telemetry.accelY}, {telemetry.accelZ}
+                </AppText>
+              </View>
+            )}
+            {telemetry.gyroX !== undefined && (
+              <View style={styles.metricPill}>
+                <AppText variant="caption" style={styles.metricLabel}>Gyro (X/Y/Z)</AppText>
+                <AppText variant="caption" weight="bold" style={styles.metricValue}>
+                  {telemetry.gyroX}, {telemetry.gyroY}, {telemetry.gyroZ}
+                </AppText>
+              </View>
+            )}
+          </View>
+        )}
       </View>
 
       {/* 4. ESP32 Device Info Block */}
@@ -392,6 +413,28 @@ const styles = StyleSheet.create({
   movementActiveText: {
     color: '#15803D',
     fontSize: 10,
+  },
+  movementMetricsRow: {
+    flexDirection: 'row',
+    gap: theme.spacing.xs,
+    marginTop: theme.spacing.xs,
+  },
+  metricPill: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
+    paddingVertical: 4,
+    paddingHorizontal: 8,
+    borderRadius: theme.borderRadius.sm,
+    borderWidth: 1,
+    borderColor: theme.colors.neutral[200],
+  },
+  metricLabel: {
+    color: theme.colors.neutral[500],
+    fontSize: 9,
+  },
+  metricValue: {
+    color: theme.colors.neutral[800],
+    fontSize: 11,
   },
   deviceBlock: {
     marginBottom: theme.spacing.sm,

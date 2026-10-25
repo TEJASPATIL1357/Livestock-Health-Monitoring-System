@@ -1,8 +1,10 @@
 class WebSocketService {
   constructor() {
     this.ws = null;
-    this.listeners = new Set();
-    this.url = 'ws://localhost:8085/ws/telemetry';
+    const defaultWsUrl = import.meta.env.PROD
+      ? 'wss://smart-livestock-backend-98l7.onrender.com/ws/telemetry'
+      : 'ws://localhost:8085/ws/telemetry';
+    this.url = import.meta.env.VITE_WS_URL || defaultWsUrl;
     this.reconnectInterval = 5000;
     this.shouldReconnect = true;
   }

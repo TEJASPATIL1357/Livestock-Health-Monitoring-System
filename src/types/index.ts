@@ -125,7 +125,7 @@ export interface Device {
   farmId: string;
   animalId?: string;
   animalName?: string;
-  status: 'ACTIVE' | 'INACTIVE' | 'UNASSIGNED';
+  status: 'ACTIVE' | 'INACTIVE' | 'UNASSIGNED' | 'REVOKED' | 'OFFLINE';
   lastSeenAt?: string;
   createdAt?: string;
   updatedAt?: string;

@@ -132,7 +132,7 @@ export class HttpClient {
 
   public static async request<T>(
     endpoint: string,
-    method: 'GET' | 'POST' | 'PUT' | 'DELETE',
+    method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH',
     body?: unknown,
     options: RequestOptions = {}
   ): Promise<ApiResponse<T>> {

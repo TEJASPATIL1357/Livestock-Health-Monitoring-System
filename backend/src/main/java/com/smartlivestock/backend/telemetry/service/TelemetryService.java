@@ -142,8 +142,13 @@ public class TelemetryService {
 
         SensorTelemetry saved = telemetryRepository.save(telemetry);
 
-        // Trigger automatic AI assessment update
-        aiHealthIntelligenceService.evaluateAnimalHealth(device.getAnimal(), Duration.ofHours(24));
+        // Trigger automatic AI assessment update (gracefully degraded to ensure telemetry ingestion never fails)
+        try {
+            aiHealthIntelligenceService.evaluateAnimalHealth(device.getAnimal(), Duration.ofHours(24));
+        } catch (Exception e) {
+            org.slf4j.LoggerFactory.getLogger(TelemetryService.class)
+                    .warn("AI assessment failed during telemetry ingestion: {}", e.getMessage());
+        }
 
         return TelemetryResponse.fromEntity(saved);
     }
