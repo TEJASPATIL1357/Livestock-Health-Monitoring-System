@@ -19,6 +19,7 @@
       },
       "predictiveBackGestureEnabled": false,
       "package": "com.smartlivestock.health",
+      "versionCode": 2,
       "usesCleartextTraffic": true
     },
     "web": {
