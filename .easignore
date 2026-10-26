@@ -1,0 +1,42 @@
+# EAS Build Ignore File
+# Excludes non-mobile components and build caches from EAS upload archive
+
+# Local Android build caches & artifacts
+android/.gradle/
+android/build/
+android/app/build/
+android/.cxx/
+android/app/.cxx/
+android/local.properties
+.gradle/
+build/
+
+# Dependencies & Expo cache
+node_modules/
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Non-mobile project subtrees
+backend/
+firmware/
+web/
+scripts/
+scratch/
+
+# Database dumps, sql scripts, and local logs
+*.sql
+*.dump
+backup_*
+*.log
+*.txt
+
+# Local environments and secrets
+.env*
+!*.example
+**/secrets.h
+
+# macOS & system
+.DS_Store
+Thumbs.db
