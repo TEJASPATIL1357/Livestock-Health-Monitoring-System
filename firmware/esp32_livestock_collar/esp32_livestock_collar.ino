@@ -123,66 +123,87 @@ int consecutiveFailures = 0;
 bool mpuInitialized = false;
 
 /**
- * Parses HTTP Date header format: "Day, DD Mon YYYY HH:MM:SS GMT"
- * Returns UNIX epoch timestamp, or 0 on failure.
+ * Parses RFC 2822 / HTTP Date header into UNIX epoch timestamp.
+ * Supported format: "[Day,] DD Mon YYYY HH:MM:SS GMT"
+ * Uses pure UTC calendar arithmetic to prevent local timezone offsets from skewing the clock.
  */
 time_t parseHttpDate(const char* dateStr) {
-    if (!dateStr || strlen(dateStr) < 25) return 0;
-    const char* p = strchr(dateStr, ' ');
-    if (!p) return 0;
-    p++; // Points to DD
+    if (!dateStr || strlen(dateStr) < 20) return 0;
+
+    const char* p = dateStr;
+    if (strchr(p, ',')) {
+        p = strchr(p, ',');
+        p++;
+    }
+    while (*p == ' ') p++;
+
     int day = atoi(p);
+    if (day < 1 || day > 31) return 0;
+
     p = strchr(p, ' ');
     if (!p) return 0;
-    p++; // Points to Mon
+    while (*p == ' ') p++;
+
     char monStr[4] = { p[0], p[1], p[2], '\0' };
-    int month = 0;
-    const char* months[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+    int month = -1;
+    static const char* months[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
     for (int i = 0; i < 12; i++) {
         if (strcasecmp(monStr, months[i]) == 0) {
             month = i;
             break;
         }
     }
+    if (month == -1) return 0;
+
     p = strchr(p, ' ');
     if (!p) return 0;
-    p++; // Points to YYYY
+    while (*p == ' ') p++;
+
     int year = atoi(p);
+    if (year < 2024 || year > 2035) return 0;
+
     p = strchr(p, ' ');
     if (!p) return 0;
-    p++; // Points to HH:MM:SS
+    while (*p == ' ') p++;
+
     int hour = 0, minute = 0, second = 0;
-    sscanf(p, "%d:%d:%d", &hour, &minute, &second);
+    if (sscanf(p, "%d:%d:%d", &hour, &minute, &second) < 3) return 0;
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 60) return 0;
 
-    struct tm tmTime;
-    memset(&tmTime, 0, sizeof(tmTime));
-    tmTime.tm_year = year - 1900;
-    tmTime.tm_mon = month;
-    tmTime.tm_mday = day;
-    tmTime.tm_hour = hour;
-    tmTime.tm_min = minute;
-    tmTime.tm_sec = second;
+    // Pure UTC epoch conversion (no local timezone dependency)
+    static const int daysBeforeMonth[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
+    int y = year - 1970;
+    int leapDays = (year - 1969) / 4 - (year - 1901) / 100 + (year - 1601) / 400;
+    bool isLeap = ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0));
+    int days = y * 365 + leapDays + daysBeforeMonth[month];
+    if (isLeap && month > 1) days++;
+    days += (day - 1);
 
-    return mktime(&tmTime);
+    return (time_t)days * 86400ULL + (time_t)hour * 3600ULL + (time_t)minute * 60ULL + (time_t)second;
 }
 
 /**
  * Dual-path system clock synchronizer.
- * Primary: NTP (UDP 123) with multiple global servers.
- * Fallback: Plain HTTP Date header from Render port 80 (bypasses UDP 123 blocking on cellular hotspots).
+ * Primary: Tier-1 Anycast NTP pools (time.google.com, time.cloudflare.com, pool.ntp.org).
+ * Fallback: Trusted plain HTTP Date header endpoints (connectivitycheck.gstatic.com, google.com).
+ *
+ * SECURITY NOTE:
+ * The HTTP Date fallback is used strictly as a non-cryptographic bootstrap hint to advance
+ * the RTC from 1970 into the certificate validity window. Full cryptographic trust is strictly
+ * enforced during the subsequent TLS 1.3 handshake via ISRG Root X1 and GTS Root R4 certificate validation.
  */
 bool syncSystemTime() {
     Serial.println(F("[TIME] Synchronizing system clock for strict TLS verification..."));
 
-    // 1. Primary: NTP via SNTP
-    configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+    // 1. Primary: Anycast Tier-1 NTP via SNTP (UDP port 123)
+    configTime(0, 0, "time.google.com", "time.cloudflare.com", "pool.ntp.org");
     unsigned long ntpStart = millis();
-    while (millis() - ntpStart < 6000) {
+    while (millis() - ntpStart < 8000) {
         time_t now = time(nullptr);
         if (now >= EARLIEST_VALID_EPOCH) {
             struct tm timeinfo;
             gmtime_r(&now, &timeinfo);
-            Serial.printf("[NTP] SUCCESS: Clock synced via NTP (%04d-%02d-%02d %02d:%02d:%02d UTC)\n",
+            Serial.printf("[NTP] SUCCESS: Clock synced via Tier-1 NTP (%04d-%02d-%02d %02d:%02d:%02d UTC)\n",
                 timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
                 timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
             return true;
@@ -193,37 +214,53 @@ bool syncSystemTime() {
     Serial.println();
     Serial.println(F("[NTP] Warning: NTP timed out (UDP port 123 may be filtered by carrier/hotspot)."));
 
-    // 2. Fallback: HTTP Date header from backend host (Port 80 plain HTTP)
-    Serial.println(F("[TIME] Attempting HTTP Date fallback via port 80 to backend..."));
+    // 2. Fallback: High-availability HTTP bootstrap endpoints
+    static const char* BOOTSTRAP_URLS[] = {
+        "http://connectivitycheck.gstatic.com/generate_204",
+        "http://www.google.com",
+        "http://smart-livestock-backend-98l7.onrender.com/api/v1/health"
+    };
+
+    Serial.println(F("[TIME] Attempting HTTP Date fallback for TLS clock bootstrap..."));
     HTTPClient httpFallback;
     WiFiClient plainClient;
-    const char* healthUrl = "http://smart-livestock-backend-98l7.onrender.com/api/v1/health";
-    httpFallback.begin(plainClient, healthUrl);
-    httpFallback.setTimeout(8000);
     const char* headerKeys[] = {"Date"};
-    httpFallback.collectHeaders(headerKeys, 1);
-    int httpCode = httpFallback.GET();
 
-    if (httpCode > 0 && httpFallback.hasHeader("Date")) {
-        String dateHeader = httpFallback.header("Date");
-        time_t parsedTime = parseHttpDate(dateHeader.c_str());
-        if (parsedTime >= EARLIEST_VALID_EPOCH) {
-            struct timeval tv = { .tv_sec = parsedTime, .tv_usec = 0 };
-            settimeofday(&tv, NULL);
-            struct tm timeinfo;
-            gmtime_r(&parsedTime, &timeinfo);
-            Serial.printf("[HTTP-TIME] SUCCESS: Clock set via HTTP Date header (%04d-%02d-%02d %02d:%02d:%02d UTC)\n",
-                timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
-                timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-            httpFallback.end();
-            return true;
+    for (size_t i = 0; i < sizeof(BOOTSTRAP_URLS) / sizeof(BOOTSTRAP_URLS[0]); i++) {
+        const char* targetUrl = BOOTSTRAP_URLS[i];
+        Serial.printf("[TIME] Probing fallback endpoint: %s\n", targetUrl);
+
+        httpFallback.begin(plainClient, targetUrl);
+        httpFallback.setTimeout(4000);
+        httpFallback.collectHeaders(headerKeys, 1);
+        int httpCode = httpFallback.GET();
+
+        if (httpCode > 0 && httpFallback.hasHeader("Date")) {
+            String dateHeader = httpFallback.header("Date");
+            time_t parsedTime = parseHttpDate(dateHeader.c_str());
+
+            if (parsedTime >= EARLIEST_VALID_EPOCH && parsedTime <= 2051222400) {
+                struct timeval tv = { .tv_sec = parsedTime, .tv_usec = 0 };
+                settimeofday(&tv, NULL);
+                struct tm timeinfo;
+                gmtime_r(&parsedTime, &timeinfo);
+
+                Serial.printf("[HTTP-BOOTSTRAP] SUCCESS: Clock set via %s\n", targetUrl);
+                Serial.printf("[HTTP-BOOTSTRAP] Validated Time: %04d-%02d-%02d %02d:%02d:%02d UTC (Epoch: %ld)\n",
+                    timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                    timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, (long)parsedTime);
+                Serial.println(F("[SECURITY] Note: HTTP Date used solely as TLS bootstrap hint. TLS certificate validation will strictly authenticate server."));
+
+                httpFallback.end();
+                return true;
+            }
         }
+        httpFallback.end();
     }
-    httpFallback.end();
 
     time_t finalCheck = time(nullptr);
     if (finalCheck < EARLIEST_VALID_EPOCH) {
-        Serial.println(F("[TIME] CRITICAL: Clock unsynchronized! TLS certificate validation will fail until clock is set."));
+        Serial.println(F("[TIME] WARNING: Clock unsynchronized! Telemetry upload will retry next cycle to prevent TLS rejection."));
         return false;
     }
     return true;
