@@ -17,7 +17,7 @@ export const useAnimalsQuery = (farmId?: string) => {
   });
 };
 
-export const TELEMETRY_REFETCH_INTERVAL = 5000;
+export const TELEMETRY_REFETCH_INTERVAL = 1000;
 
 export const useTelemetryQuery = (animalId?: string) => {
   return useQuery({
@@ -27,7 +27,10 @@ export const useTelemetryQuery = (animalId?: string) => {
       return TelemetryService.getLatestTelemetry(animalId);
     },
     enabled: Boolean(animalId),
-    refetchInterval: TELEMETRY_REFETCH_INTERVAL, // Refetch every 5 seconds while active on screen
+    refetchInterval: TELEMETRY_REFETCH_INTERVAL, // Refetch every 1 second (1000ms) while active on screen
+    refetchIntervalInBackground: false,
+    placeholderData: (previousData) => previousData,
+    staleTime: 500,
   });
 };
 

@@ -48,7 +48,10 @@ public class TelemetryResponse {
             dto.setGyroX(telemetry.getGyroX());
             dto.setGyroY(telemetry.getGyroY());
             dto.setGyroZ(telemetry.getGyroZ());
-            dto.setMovementStatus("ACTIVE");
+            dto.setMovementStatus(classifyMovement(
+                    telemetry.getAccelX(), telemetry.getAccelY(), telemetry.getAccelZ(),
+                    telemetry.getGyroX(), telemetry.getGyroY(), telemetry.getGyroZ()
+            ));
         } else {
             dto.setMovementStatus("COMING_SOON");
         }
@@ -123,4 +126,30 @@ public class TelemetryResponse {
 
     public Double getGyroZ() { return gyroZ; }
     public void setGyroZ(Double gyroZ) { this.gyroZ = gyroZ; }
+
+    public static String classifyMovement(Double ax, Double ay, Double az, Double gx, Double gy, Double gz) {
+        if (ax == null && ay == null && az == null && gx == null && gy == null && gz == null) {
+            return "UNKNOWN";
+        }
+        double x = ax != null ? ax : 0.0;
+        double y = ay != null ? ay : 0.0;
+        double z = az != null ? az : 0.0;
+        double rx = gx != null ? gx : 0.0;
+        double ry = gy != null ? gy : 0.0;
+        double rz = gz != null ? gz : 0.0;
+
+        double accelMag = Math.sqrt(x * x + y * y + z * z);
+        double gyroMag = Math.sqrt(rx * rx + ry * ry + rz * rz);
+
+        // Raw counts: ~16384 LSB/g at 1g static baseline; SI units: ~9.8 m/s^2
+        double dynamicAccel = (accelMag > 500) ? Math.abs(accelMag - 16384.0) : Math.abs(accelMag - 9.8);
+
+        if (gyroMag > 2500 || dynamicAccel > 4500) {
+            return "ACTIVE";
+        } else if (gyroMag > 350 || dynamicAccel > 1000) {
+            return "NORMAL";
+        } else {
+            return "RESTING";
+        }
+    }
 }

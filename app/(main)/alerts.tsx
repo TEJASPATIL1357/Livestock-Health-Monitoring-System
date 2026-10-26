@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { View, StyleSheet, TouchableOpacity, FlatList, ActivityIndicator } from 'react-native';
 import { useTranslation } from 'react-i18next';
-import { ShieldCheck, CircleDashed, Clock, AlertTriangle, CheckCircle2 } from 'lucide-react-native';
+import { ShieldCheck, AlertTriangle, CheckCircle2 } from 'lucide-react-native';
 import { ScreenContainer } from '../../src/components/ScreenContainer';
 import { AppHeader } from '../../src/components/AppHeader';
 import { AppText } from '../../src/components/AppText';

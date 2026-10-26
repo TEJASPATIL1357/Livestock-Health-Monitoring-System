@@ -19,11 +19,37 @@ import { FarmHeroHeader } from '../../src/components/FarmHeroHeader';
 import { GridNavCard } from '../../src/components/GridNavCard';
 import { AiAssistantBanner } from '../../src/components/AiAssistantBanner';
 import { FarmSelector } from '../../src/components/FarmSelector';
+import { AnimalTelemetryCard } from '../../src/components/AnimalTelemetryCard';
 import { useAuthStore } from '../../src/store/useAuthStore';
 import { useAppStore } from '../../src/store/useAppStore';
-import { useAnimalsQuery, useUnreadAlertsCountQuery, useAlertsQuery } from '../../src/hooks/useLivestockTelemetry';
+import {
+  useAnimalsQuery,
+  useUnreadAlertsCountQuery,
+  useAlertsQuery,
+  useTelemetryQuery,
+  useAiAssessmentQuery,
+  useDeviceForAnimalQuery,
+} from '../../src/hooks/useLivestockTelemetry';
 import { theme } from '../../src/theme/theme';
-import { Farm } from '../../src/types';
+import { Farm, Animal } from '../../src/types';
+
+// Child component rendering an animal card with 1-second auto-refreshing telemetry hooks
+const LiveAnimalTelemetryItem: React.FC<{ animal: Animal }> = ({ animal }) => {
+  const { data: telemetry, isLoading: isTelemetryLoading, isError } = useTelemetryQuery(animal.id);
+  const { data: assessment } = useAiAssessmentQuery(animal.id);
+  const { data: device } = useDeviceForAnimalQuery(animal.id);
+
+  return (
+    <AnimalTelemetryCard
+      animal={animal}
+      telemetry={telemetry}
+      assessment={assessment}
+      device={device}
+      isLoading={isTelemetryLoading}
+      isError={isError}
+    />
+  );
+};
 
 export default function HomeScreen() {
   const router = useRouter();
@@ -107,6 +133,26 @@ export default function HomeScreen() {
         statusType={animalCount > 0 ? 'healthy' : 'noData'}
         onSelectFarm={() => setFarmSelectorVisible(true)}
       />
+
+      {/* Live Monitored Livestock Card (1-second auto-updating telemetry) */}
+      {animals.length > 0 && (
+        <View style={styles.liveSectionContainer}>
+          <View style={styles.liveSectionHeader}>
+            <View style={styles.liveBadgeHeader}>
+              <View style={styles.livePulsingDot} />
+              <AppText variant="h3" weight="bold" style={styles.liveSectionTitle}>
+                Live Monitored Telemetry
+              </AppText>
+            </View>
+            <TouchableOpacity onPress={() => router.push('/(main)/animals')}>
+              <AppText variant="label" weight="semibold" style={styles.viewAllText}>
+                All Livestock ({animals.length})
+              </AppText>
+            </TouchableOpacity>
+          </View>
+          <LiveAnimalTelemetryItem animal={animals[0]} />
+        </View>
+      )}
 
       {/* 2x3 Feature Navigation Grid */}
       <AppText variant="h3" weight="bold" style={styles.sectionTitle}>
@@ -363,5 +409,30 @@ const styles = StyleSheet.create({
     color: theme.colors.neutral[500],
     textAlign: 'center',
     fontSize: 11,
+  },
+  liveSectionContainer: {
+    marginBottom: theme.spacing.md,
+  },
+  liveSectionHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: theme.spacing.xs + 2,
+    marginTop: theme.spacing.xs,
+  },
+  liveBadgeHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  livePulsingDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#16A34A',
+  },
+  liveSectionTitle: {
+    color: theme.colors.neutral[900],
+    fontSize: 16,
   },
 });

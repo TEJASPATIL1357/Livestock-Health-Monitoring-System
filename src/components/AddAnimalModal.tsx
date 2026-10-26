@@ -82,7 +82,7 @@ export const AddAnimalModal: React.FC<AddAnimalModalProps> = ({
         animalId: createdAnimalId,
       });
       handleClose();
-    } catch (err: any) {
+    } catch {
       setCollarAssignFailed(true);
       setApiError(t('animals.collarAssignFailed'));
     }

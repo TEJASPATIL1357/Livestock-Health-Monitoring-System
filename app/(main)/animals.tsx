@@ -51,7 +51,7 @@ export default function AnimalsScreen() {
   const [selectedFilter, setSelectedFilter] = useState<'ALL' | 'HEALTHY' | 'ATTENTION'>('ALL');
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
 
-  const { data: animals = [], isLoading } = useAnimalsQuery(activeFarm?.id);
+  const { data: animals = [] } = useAnimalsQuery(activeFarm?.id);
 
   const filteredAnimals = animals.filter((item) => {
     const matchesSearch =
