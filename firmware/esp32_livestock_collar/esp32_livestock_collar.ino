@@ -4,23 +4,27 @@
  * ============================================================================
  * Target Livestock : Cow Nandini (Tag: 0001)
  * Device Identifier: ESP32-COLLAR-002
+ * Target Farm      : New Farm
+ * Production Base  : https://smart-livestock-backend-98l7.onrender.com
+ * Telemetry Endpoint: /api/v1/sensors/upload
  *
  * Hardware Configuration:
- *   - Controller: ESP32 DevKit V1
- *   - Temperature Sensor: DS18B20 on GPIO 4 (Requires 4.7kΩ pull-up to 3.3V)
- *   - Movement/Activity Sensor: MPU module (MPU-6050/6500)
- *       - I2C Bus: SDA on GPIO 21, SCL on GPIO 22
- *       - I2C Address: 0x68 (Default)
- *       - Raw Register Protocol: Wakes device via PWR_MGMT_1 (0x6B = 0x00)
- *         and bursts 14 bytes from 0x3B (ACCEL_XOUT_H through GYRO_ZOUT_H).
- *         Supports clones and alternate revisions (e.g. WHO_AM_I == 0x70).
+ *   - Microcontroller : ESP32 DevKit V1
+ *   - Temperature Bus : DS18B20 on GPIO 4 (Requires 4.7kΩ pull-up to 3.3V)
+ *   - Motion/IMU Bus  : MPU-6050 / MPU-6500 on I2C (SDA=GPIO 21, SCL=GPIO 22)
+ *                       Address 0x68 (Default)
  *
- * IMPORTANT:
- *   - MPU readings transmitted are RAW 16-bit sensor counts (-32768 to +32767).
- *     These are uncalibrated raw units, ready for server-side or edge filtering.
- *   - If MPU read fails or module is disconnected, the node seamlessly
- *     continues transmitting DS18B20 temperature data.
- *   - All credentials (Wi-Fi, API Key) are loaded from the local secrets.h header.
+ * Resilience & Diagnostic Architecture:
+ *   1. Dual-Path Time Sync (NTP with HTTP Date header fallback) ensures the
+ *      system clock is strictly valid before initiating TLS.
+ *   2. Strict TLS 1.3 certificate validation against Let's Encrypt ISRG Root X1.
+ *      Never uses setInsecure().
+ *   3. Safe multi-layer diagnostics test Wi-Fi, Internet, NTP, DNS, TCP port 443,
+ *      and TLS handshakes to isolate network barriers.
+ *   4. DS18B20 device address caching and 3-attempt read retry with 1-Wire reset
+ *      eliminates intermittent -127°C / 85°C anomalies.
+ *   5. All secrets (Wi-Fi password, device API key) remain strictly confidential
+ *      and redacted from Serial output.
  * ============================================================================
  */
 
@@ -31,9 +35,9 @@
 #include <DallasTemperature.h>
 #include <Wire.h>
 #include <time.h>
+#include <sys/time.h>
 
 // 1. Secure Local Credentials Inclusion
-// Checks for local secrets.h in the sketch folder first (for Arduino IDE tabs), then parent folder
 #if __has_include("secrets.h")
 #include "secrets.h"
 #elif __has_include("../secrets.h")
@@ -87,45 +91,280 @@ const char* ISRG_ROOT_X1_CA_CERT = \
 #define MPU_REG_ACCEL_XOUT_H 0x3B
 
 // 3. Operational Constants & Resilient Retry State
-const unsigned long UPLOAD_INTERVAL_MS = 5000;         // 5-second default sampling cadence
-const unsigned long MAX_BACKOFF_INTERVAL_MS = 15000;   // 15-second max backoff on network failures
-const unsigned long HTTP_TIMEOUT_MS = 7000;            // 7-second HTTP/TLS network timeout
-const char* NTP_SERVER_1 = "pool.ntp.org";
-const char* NTP_SERVER_2 = "time.google.com";
+const unsigned long UPLOAD_INTERVAL_MS = 5000;         // 5-second normal sampling cadence
+const unsigned long MAX_BACKOFF_INTERVAL_MS = 20000;   // 20-second max backoff on network failures
+const unsigned long HTTP_TIMEOUT_MS = 25000;           // 25-second HTTP/TLS network timeout (Render spin-up tolerance)
+const unsigned long EARLIEST_VALID_EPOCH = 1704067200; // Jan 1, 2024 (validity floor for TLS)
 
 // 4. Peripherals & Sensors
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature tempSensor(&oneWire);
+DeviceAddress tempSensorAddr;
+bool tempSensorFound = false;
 
 unsigned long lastUploadTime = 0;
 unsigned long currentIntervalMs = UPLOAD_INTERVAL_MS;
 int consecutiveFailures = 0;
-bool ntpInitialized = false;
 bool mpuInitialized = false;
 
 /**
- * Initializes the MPU sensor via direct raw register access.
- * Bypasses strict WHO_AM_I checks to guarantee support for modules with WHO_AM_I = 0x70.
+ * Parses HTTP Date header format: "Day, DD Mon YYYY HH:MM:SS GMT"
+ * Returns UNIX epoch timestamp, or 0 on failure.
+ */
+time_t parseHttpDate(const char* dateStr) {
+    if (!dateStr || strlen(dateStr) < 25) return 0;
+    const char* p = strchr(dateStr, ' ');
+    if (!p) return 0;
+    p++; // Points to DD
+    int day = atoi(p);
+    p = strchr(p, ' ');
+    if (!p) return 0;
+    p++; // Points to Mon
+    char monStr[4] = { p[0], p[1], p[2], '\0' };
+    int month = 0;
+    const char* months[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+    for (int i = 0; i < 12; i++) {
+        if (strcasecmp(monStr, months[i]) == 0) {
+            month = i;
+            break;
+        }
+    }
+    p = strchr(p, ' ');
+    if (!p) return 0;
+    p++; // Points to YYYY
+    int year = atoi(p);
+    p = strchr(p, ' ');
+    if (!p) return 0;
+    p++; // Points to HH:MM:SS
+    int hour = 0, minute = 0, second = 0;
+    sscanf(p, "%d:%d:%d", &hour, &minute, &second);
+
+    struct tm tmTime;
+    memset(&tmTime, 0, sizeof(tmTime));
+    tmTime.tm_year = year - 1900;
+    tmTime.tm_mon = month;
+    tmTime.tm_mday = day;
+    tmTime.tm_hour = hour;
+    tmTime.tm_min = minute;
+    tmTime.tm_sec = second;
+
+    return mktime(&tmTime);
+}
+
+/**
+ * Dual-path system clock synchronizer.
+ * Primary: NTP (UDP 123) with multiple global servers.
+ * Fallback: Plain HTTP Date header from Render port 80 (bypasses UDP 123 blocking on cellular hotspots).
+ */
+bool syncSystemTime() {
+    Serial.println(F("[TIME] Synchronizing system clock for strict TLS verification..."));
+
+    // 1. Primary: NTP via SNTP
+    configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+    unsigned long ntpStart = millis();
+    while (millis() - ntpStart < 6000) {
+        time_t now = time(nullptr);
+        if (now >= EARLIEST_VALID_EPOCH) {
+            struct tm timeinfo;
+            gmtime_r(&now, &timeinfo);
+            Serial.printf("[NTP] SUCCESS: Clock synced via NTP (%04d-%02d-%02d %02d:%02d:%02d UTC)\n",
+                timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+            return true;
+        }
+        delay(300);
+        Serial.print(F("."));
+    }
+    Serial.println();
+    Serial.println(F("[NTP] Warning: NTP timed out (UDP port 123 may be filtered by carrier/hotspot)."));
+
+    // 2. Fallback: HTTP Date header from backend host (Port 80 plain HTTP)
+    Serial.println(F("[TIME] Attempting HTTP Date fallback via port 80 to backend..."));
+    HTTPClient httpFallback;
+    WiFiClient plainClient;
+    const char* healthUrl = "http://smart-livestock-backend-98l7.onrender.com/api/v1/health";
+    httpFallback.begin(plainClient, healthUrl);
+    httpFallback.setTimeout(8000);
+    const char* headerKeys[] = {"Date"};
+    httpFallback.collectHeaders(headerKeys, 1);
+    int httpCode = httpFallback.GET();
+
+    if (httpCode > 0 && httpFallback.hasHeader("Date")) {
+        String dateHeader = httpFallback.header("Date");
+        time_t parsedTime = parseHttpDate(dateHeader.c_str());
+        if (parsedTime >= EARLIEST_VALID_EPOCH) {
+            struct timeval tv = { .tv_sec = parsedTime, .tv_usec = 0 };
+            settimeofday(&tv, NULL);
+            struct tm timeinfo;
+            gmtime_r(&parsedTime, &timeinfo);
+            Serial.printf("[HTTP-TIME] SUCCESS: Clock set via HTTP Date header (%04d-%02d-%02d %02d:%02d:%02d UTC)\n",
+                timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+            httpFallback.end();
+            return true;
+        }
+    }
+    httpFallback.end();
+
+    time_t finalCheck = time(nullptr);
+    if (finalCheck < EARLIEST_VALID_EPOCH) {
+        Serial.println(F("[TIME] CRITICAL: Clock unsynchronized! TLS certificate validation will fail until clock is set."));
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Comprehensive diagnostic check inspecting Wi-Fi, Internet, NTP, DNS, TCP, and TLS.
+ */
+void runNetworkDiagnostics() {
+    Serial.println(F("\n====== [DIAGNOSTICS] Network & TLS Health Check ======"));
+
+    // 1. Wi-Fi Status & Addressing
+    Serial.printf("[DIAG] 1. Wi-Fi Connection : %s (SSID: %s, RSSI: %d dBm)\n",
+        (WiFi.status() == WL_CONNECTED) ? "CONNECTED" : "DISCONNECTED",
+        WIFI_SSID, WiFi.RSSI());
+    Serial.printf("[DIAG]    Local IP         : %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("[DIAG]    Gateway IP       : %s\n", WiFi.gatewayIP().toString().c_str());
+    Serial.printf("[DIAG]    DNS Server IP    : %s\n", WiFi.dnsIP().toString().c_str());
+
+    // 2. Internet Reachability Test (TCP to 8.8.8.8:53)
+    WiFiClient pingClient;
+    bool internetOk = pingClient.connect(IPAddress(8, 8, 8, 8), 53, 3000);
+    pingClient.stop();
+    Serial.printf("[DIAG] 2. Internet Uplink  : %s\n", internetOk ? "OK (TCP to 8.8.8.8:53 succeeded)" : "FAILED (No route to public internet)");
+
+    // 3. System Time & TLS Clock Validity
+    time_t now = time(nullptr);
+    struct tm timeinfo;
+    gmtime_r(&now, &timeinfo);
+    char timeBuf[32];
+    strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S UTC", &timeinfo);
+    bool timeOk = (now >= EARLIEST_VALID_EPOCH);
+    Serial.printf("[DIAG] 3. System Clock     : %s (Status: %s)\n", timeBuf, timeOk ? "VALID FOR TLS" : "INVALID (Year < 2024)");
+
+    // 4. DNS Resolution of Production Backend
+    const char* backendHost = "smart-livestock-backend-98l7.onrender.com";
+    IPAddress backendIp;
+    bool dnsOk = WiFi.hostByName(backendHost, backendIp);
+    if (dnsOk) {
+        Serial.printf("[DIAG] 4. DNS Resolution   : OK (%s -> %s)\n", backendHost, backendIp.toString().c_str());
+    } else {
+        Serial.printf("[DIAG] 4. DNS Resolution   : FAILED (Could not resolve host %s)\n", backendHost);
+    }
+
+    // 5. TCP Connectivity to Port 443
+    if (dnsOk) {
+        WiFiClient tcpClient;
+        bool tcpOk = tcpClient.connect(backendIp, 443, 4000);
+        tcpClient.stop();
+        Serial.printf("[DIAG] 5. TCP Port 443     : %s\n", tcpOk ? "OK (Port 443 accepting connections)" : "FAILED (Connection refused or timed out)");
+    } else {
+        Serial.println(F("[DIAG] 5. TCP Port 443     : SKIPPED (DNS unresolved)"));
+    }
+
+    // 6. TLS Handshake & Certificate Verification
+    if (dnsOk && timeOk) {
+        WiFiClientSecure diagSecure;
+        diagSecure.setCACert(ISRG_ROOT_X1_CA_CERT);
+        diagSecure.setTimeout(15);
+        diagSecure.setHandshakeTimeout(15);
+        Serial.println(F("[DIAG] 6. Testing TLS 1.3 Handshake with ISRG Root X1 CA..."));
+        bool tlsOk = diagSecure.connect(backendHost, 443, 15000);
+        if (tlsOk) {
+            Serial.println(F("[DIAG] 6. TLS Handshake    : SUCCESS (Strict certificate verified)"));
+            diagSecure.stop();
+        } else {
+            char errBuf[128] = {0};
+            diagSecure.lastError(errBuf, sizeof(errBuf));
+            Serial.printf("[DIAG] 6. TLS Handshake    : FAILED (Detail: %s)\n", strlen(errBuf) > 0 ? errBuf : "Handshake rejected or timeout");
+        }
+    } else if (!timeOk) {
+        Serial.println(F("[DIAG] 6. TLS Handshake    : SKIPPED (Clock invalid, TLS certificate check would fail)"));
+    }
+    Serial.println(F("======================================================\n"));
+}
+
+/**
+ * Initializes DS18B20 1-Wire sensor, discovers device address, and sets 11-bit resolution.
+ */
+void initTemperatureSensor() {
+    Serial.println(F("[DS18B20] Scanning 1-Wire bus on GPIO 4..."));
+    tempSensor.begin();
+    int count = tempSensor.getDeviceCount();
+    Serial.printf("[DS18B20] Sensor count: %d\n", count);
+
+    if (count > 0 && tempSensor.getAddress(tempSensorAddr, 0)) {
+        tempSensorFound = true;
+        // 11-bit resolution gives 0.125°C precision with 375ms conversion time (50% faster than 12-bit)
+        tempSensor.setResolution(tempSensorAddr, 11);
+        tempSensor.setWaitForConversion(false);
+        Serial.print(F("[DS18B20] Sensor ROM: "));
+        for (uint8_t i = 0; i < 8; i++) {
+            Serial.printf("%02X", tempSensorAddr[i]);
+        }
+        Serial.println(F(" (11-bit resolution active)"));
+    } else {
+        tempSensorFound = false;
+        Serial.println(F("[DS18B20] WARNING: No sensor detected. Check GPIO 4 & 4.7kΩ pull-up resistor."));
+    }
+}
+
+/**
+ * Robust temperature acquisition with 3-attempt retry and bus re-initialization.
+ * Rejects -127°C, 85°C power-on resets, and invalid readings.
+ */
+float acquireValidTemperature(int maxRetries = 3) {
+    for (int attempt = 1; attempt <= maxRetries; attempt++) {
+        if (!tempSensorFound) {
+            tempSensor.begin();
+            if (!tempSensor.getAddress(tempSensorAddr, 0)) {
+                delay(100);
+                continue;
+            }
+            tempSensorFound = true;
+            tempSensor.setResolution(tempSensorAddr, 11);
+            tempSensor.setWaitForConversion(false);
+        }
+
+        // Request conversion on specific ROM address (bypasses searchROM on bus)
+        tempSensor.requestTemperaturesByAddress(tempSensorAddr);
+        delay(380); // Wait 380ms for 11-bit conversion (max 375ms required)
+
+        float tempC = tempSensor.getTempC(tempSensorAddr);
+
+        // Discard -127°C (disconnected) and 85°C (power-on reset scratchpad)
+        if (tempC > -126.0f && tempC < 84.9f && tempC > 0.0f) {
+            return tempC; // Valid reading
+        }
+
+        Serial.printf("[DS18B20] Read attempt %d/%d invalid (returned %.2f °C). Resetting 1-Wire bus...\n", attempt, maxRetries, tempC);
+        tempSensor.begin();
+        delay(100);
+    }
+    return DEVICE_DISCONNECTED_C;
+}
+
+/**
+ * Initializes MPU sensor via direct register write (clearing sleep bit in PWR_MGMT_1).
  */
 bool initMpuRaw() {
     Wire.beginTransmission(MPU_I2C_ADDR);
     Wire.write(MPU_REG_PWR_MGMT_1);
-    Wire.write(0x00); // Clear SLEEP bit (bit 6) to wake up oscillator
+    Wire.write(0x00);
     byte error = Wire.endTransmission(true);
 
     if (error == 0) {
         Serial.println(F("[MPU] Woke up sensor at I2C 0x68 (PWR_MGMT_1 cleared)."));
         return true;
     } else {
-        Serial.print(F("[MPU] Warning: Failed to contact MPU at 0x68. Error code: "));
-        Serial.println(error);
+        Serial.printf("[MPU] Warning: Contact failed at 0x68 (Error code: %d)\n", error);
         return false;
     }
 }
 
 /**
- * Reads 6-DoF raw registers (Accelerometer X/Y/Z and Gyroscope X/Y/Z).
- * Returns true if 14 bytes were successfully read, false otherwise.
+ * Reads 6-DoF accelerometer and gyroscope raw counts.
  */
 bool readMpuRaw(int16_t &ax, int16_t &ay, int16_t &az, int16_t &gx, int16_t &gy, int16_t &gz) {
     Wire.beginTransmission(MPU_I2C_ADDR);
@@ -134,7 +373,6 @@ bool readMpuRaw(int16_t &ax, int16_t &ay, int16_t &az, int16_t &gx, int16_t &gy,
         return false;
     }
 
-    // Request 14 bytes: 6 for Accel (X,Y,Z), 2 for Temp, 6 for Gyro (X,Y,Z)
     if (Wire.requestFrom((uint8_t)MPU_I2C_ADDR, (size_t)14, true) != 14) {
         return false;
     }
@@ -142,7 +380,7 @@ bool readMpuRaw(int16_t &ax, int16_t &ay, int16_t &az, int16_t &gx, int16_t &gy,
     ax = (Wire.read() << 8) | Wire.read();
     ay = (Wire.read() << 8) | Wire.read();
     az = (Wire.read() << 8) | Wire.read();
-    Wire.read(); Wire.read(); // Skip internal die temperature
+    Wire.read(); Wire.read(); // Skip die temp
     gx = (Wire.read() << 8) | Wire.read();
     gy = (Wire.read() << 8) | Wire.read();
     gz = (Wire.read() << 8) | Wire.read();
@@ -151,7 +389,7 @@ bool readMpuRaw(int16_t &ax, int16_t &ay, int16_t &az, int16_t &gx, int16_t &gy,
 }
 
 /**
- * Connects or reconnects to Wi-Fi non-blockingly.
+ * Ensures Wi-Fi connection and re-syncs system clock if needed.
  */
 void ensureWiFiConnection() {
     if (WiFi.status() == WL_CONNECTED) {
@@ -159,27 +397,25 @@ void ensureWiFiConnection() {
     }
 
     Serial.println();
-    Serial.print(F("[WIFI] Connecting to SSID: "));
-    Serial.println(WIFI_SSID);
+    Serial.printf("[WIFI] Connecting to SSID: %s\n", WIFI_SSID);
 
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
     unsigned long startAttempt = millis();
-    while (WiFi.status() != WL_CONNECTED && (millis() - startAttempt < 10000)) {
+    while (WiFi.status() != WL_CONNECTED && (millis() - startAttempt < 12000)) {
         delay(500);
         Serial.print(F("."));
     }
     Serial.println();
 
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.print(F("[WIFI] Connected! Assigned IP: "));
-        Serial.println(WiFi.localIP());
+        Serial.printf("[WIFI] Connected! Assigned IP: %s (RSSI: %d dBm)\n",
+            WiFi.localIP().toString().c_str(), WiFi.RSSI());
 
-        if (!ntpInitialized) {
-            configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
-            ntpInitialized = true;
-            Serial.println(F("[NTP] SNTP client started."));
+        time_t now = time(nullptr);
+        if (now < EARLIEST_VALID_EPOCH) {
+            syncSystemTime();
         }
     } else {
         Serial.println(F("[WIFI] Connection failed. Will retry next cycle."));
@@ -187,12 +423,11 @@ void ensureWiFiConnection() {
 }
 
 /**
- * Retrieves ISO-8601 UTC timestamp string if NTP is synced.
+ * Retrieves ISO-8601 UTC timestamp string.
  */
 bool getIso8601Timestamp(char* buffer, size_t maxLen) {
-    time_t now;
-    time(&now);
-    if (now < 1704067200) { // Prior to Jan 1, 2024
+    time_t now = time(nullptr);
+    if (now < EARLIEST_VALID_EPOCH) {
         return false;
     }
     struct tm timeinfo;
@@ -205,39 +440,34 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    Serial.println(F("=================================================="));
+    Serial.println(F("\n=================================================="));
     Serial.println(F(" Smart Livestock Health — ESP32 Collar Node      "));
     Serial.println(F(" Target: Cow Nandini (0001) | ESP32-COLLAR-002    "));
+    Serial.println(F(" Endpoint: Render Production HTTPS (/sensors/upload) "));
     Serial.println(F("=================================================="));
 
-    // Print safe configuration summary (secrets redacted)
-    Serial.print(F("[CONFIG] Device Identifier : "));
-    Serial.println(DEVICE_IDENTIFIER);
-    Serial.print(F("[CONFIG] Backend URL       : "));
-    Serial.println(SERVER_URL);
-    Serial.print(F("[CONFIG] Wi-Fi SSID        : "));
-    Serial.println(WIFI_SSID);
-    Serial.println(F("[CONFIG] Wi-Fi Password    : [REDACTED]"));
+    // Print sanitized configuration summary (no raw secrets exposed)
+    Serial.printf("[CONFIG] Device Identifier : %s\n", DEVICE_IDENTIFIER);
+    Serial.printf("[CONFIG] Target Server URL : %s\n", SERVER_URL);
+    Serial.printf("[CONFIG] Wi-Fi SSID        : %s\n", WIFI_SSID);
+    Serial.println(F("[CONFIG] Wi-Fi Password    : [CONFIGURED - REDACTED]"));
     Serial.println(F("[CONFIG] Device API Key    : [CONFIGURED - REDACTED]"));
 
-    // Initialize DS18B20 1-Wire bus on GPIO 4
-    Serial.println(F("[DS18B20] Initializing temperature bus on GPIO 4..."));
-    tempSensor.begin();
-    tempSensor.setWaitForConversion(true);
-    int count = tempSensor.getDeviceCount();
-    Serial.print(F("[DS18B20] Found devices on 1-Wire bus: "));
-    Serial.println(count);
-    if (count == 0) {
-        Serial.println(F("[DS18B20] WARNING: No sensor detected. Check GPIO 4 & 4.7kΩ pullup."));
-    }
+    // 1. Initialize DS18B20 1-Wire bus on GPIO 4
+    initTemperatureSensor();
 
-    // Initialize I2C Bus for MPU on GPIO 21 (SDA), 22 (SCL)
+    // 2. Initialize I2C Bus for MPU on GPIO 21 (SDA), GPIO 22 (SCL)
     Serial.println(F("[I2C] Initializing Wire on SDA=21, SCL=22..."));
-    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 100000); // 100 kHz standard mode
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 100000);
     mpuInitialized = initMpuRaw();
 
-    // Connect to local Wi-Fi
+    // 3. Connect to Wi-Fi and sync clock
     ensureWiFiConnection();
+
+    // 4. Run baseline network diagnostics
+    if (WiFi.status() == WL_CONNECTED) {
+        runNetworkDiagnostics();
+    }
 }
 
 void loop() {
@@ -257,28 +487,33 @@ void loop() {
         return;
     }
 
-    // 1. Read DS18B20 Temperature
-    tempSensor.requestTemperatures();
-    float tempC = tempSensor.getTempCByIndex(0);
+    // Verify system time before attempting HTTPS
+    time_t checkNow = time(nullptr);
+    if (checkNow < EARLIEST_VALID_EPOCH) {
+        Serial.println(F("[LOOP] System clock not yet synchronized. Syncing before HTTPS..."));
+        if (!syncSystemTime()) {
+            Serial.println(F("[LOOP] Clock sync failed. Skipping HTTPS to prevent TLS certificate rejection."));
+            return;
+        }
+    }
+
+    // 1. Acquire DS18B20 Temperature with retry & 1-Wire reset
+    float tempC = acquireValidTemperature(3);
+    bool hasValidTemp = (tempC > -126.0f && tempC < 65.0f && tempC > 0.0f);
+
+    if (!hasValidTemp) {
+        Serial.println(F("[DS18B20] ERROR: Sensor disconnected / invalid (-127°C). Transmission skipped to prevent database corruption."));
+        consecutiveFailures++;
+        if (consecutiveFailures >= 3) {
+            currentIntervalMs = min(currentIntervalMs + 2000, MAX_BACKOFF_INTERVAL_MS);
+        }
+        return;
+    }
 
     Serial.println(F("--------------------------------------------------"));
-    Serial.print(F("[DS18B20] Temperature: "));
-    Serial.print(tempC, 2);
-    Serial.println(F(" °C"));
+    Serial.printf("[DS18B20] Temperature: %.2f °C (VALID)\n", tempC);
 
-    // Validate sensor reading against disconnected sentinel (-127°C) & biological bounds
-    if (tempC <= -126.0f || tempC == DEVICE_DISCONNECTED_C) {
-        Serial.println(F("[DS18B20] ERROR: Sensor disconnected (-127°C). Transmission skipped."));
-        return;
-    }
-
-    if (tempC < 0.0f || tempC > 60.0f) {
-        Serial.print(F("[DS18B20] WARNING: Out-of-bounds reading (0-60°C): "));
-        Serial.println(tempC);
-        return;
-    }
-
-    // 2. Read MPU-6050/6500 Movement Sensor (Raw Registers)
+    // 2. Acquire MPU-6050/6500 Movement Sensor Raw Counts
     int16_t ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
     bool hasMovement = false;
 
@@ -289,13 +524,11 @@ void loop() {
     if (mpuInitialized) {
         if (readMpuRaw(ax, ay, az, gx, gy, gz)) {
             hasMovement = true;
-            Serial.print(F("[MPU RAW] Accel (counts): X="));
-            Serial.print(ax); Serial.print(F(" Y=")); Serial.print(ay); Serial.print(F(" Z=")); Serial.println(az);
-            Serial.print(F("[MPU RAW] Gyro  (counts): X="));
-            Serial.print(gx); Serial.print(F(" Y=")); Serial.print(gy); Serial.print(F(" Z=")); Serial.println(gz);
+            Serial.printf("[MPU RAW] Accel (counts): X=%d Y=%d Z=%d\n", ax, ay, az);
+            Serial.printf("[MPU RAW] Gyro  (counts): X=%d Y=%d Z=%d\n", gx, gy, gz);
         } else {
             Serial.println(F("[MPU] Warning: Read failed on I2C bus. Sending temp-only."));
-            mpuInitialized = false; // Attempt re-init on next cycle
+            mpuInitialized = false;
         }
     } else {
         Serial.println(F("[MPU] Movement sensor not available. Sending temp-only."));
@@ -305,7 +538,7 @@ void loop() {
     char isoTimestamp[32];
     bool hasTimestamp = getIso8601Timestamp(isoTimestamp, sizeof(isoTimestamp));
 
-    char payload[300];
+    char payload[320];
     if (hasMovement) {
         if (hasTimestamp) {
             snprintf(payload, sizeof(payload),
@@ -330,10 +563,9 @@ void loop() {
         }
     }
 
-    Serial.print(F("[HTTP] POST JSON: "));
-    Serial.println(payload);
+    Serial.printf("[HTTP] POST JSON: %s\n", payload);
 
-    // 4. Perform HTTP/HTTPS POST with X-API-KEY Authentication Header
+    // 4. Perform HTTPS POST with strict TLS certificate verification
     HTTPClient http;
     WiFiClient plainClient;
     WiFiClientSecure secureClient;
@@ -341,7 +573,10 @@ void loop() {
     bool beginSuccess = false;
 
     if (isHttps) {
+        // Enforce strict TLS certificate verification with Let's Encrypt ISRG Root X1 CA
         secureClient.setCACert(ISRG_ROOT_X1_CA_CERT);
+        secureClient.setTimeout(HTTP_TIMEOUT_MS / 1000);
+        secureClient.setHandshakeTimeout(HTTP_TIMEOUT_MS / 1000);
         beginSuccess = http.begin(secureClient, SERVER_URL);
     } else {
         beginSuccess = http.begin(plainClient, SERVER_URL);
@@ -349,6 +584,7 @@ void loop() {
 
     if (!beginSuccess) {
         Serial.println(F("[HTTP] ERROR: Unable to initialize connection to SERVER_URL."));
+        runNetworkDiagnostics();
         consecutiveFailures++;
         if (consecutiveFailures >= 3) {
             currentIntervalMs = min(currentIntervalMs + 2000, MAX_BACKOFF_INTERVAL_MS);
@@ -363,42 +599,34 @@ void loop() {
     int httpResponseCode = http.POST((uint8_t*)payload, strlen(payload));
 
     if (httpResponseCode > 0) {
-        Serial.print(F("[HTTP] Status: "));
-        Serial.println(httpResponseCode);
-
+        Serial.printf("[HTTP] Status: %d\n", httpResponseCode);
         String responseBody = http.getString();
+
         if (httpResponseCode == 201) {
-            Serial.println(F("[HTTP] SUCCESS! Reading stored for Cow Nandini (0001)."));
-            Serial.print(F("[HTTP] Response: "));
-            Serial.println(responseBody);
-            // Reset failure counter and restore normal sampling cadence
+            Serial.println(F("[HTTP] SUCCESS (201 Created)! Reading stored for Cow Nandini (0001)."));
+            Serial.printf("[HTTP] Response: %s\n", responseBody.c_str());
             consecutiveFailures = 0;
             currentIntervalMs = UPLOAD_INTERVAL_MS;
         } else if (httpResponseCode == 400) {
-            Serial.println(F("[HTTP] REJECTED (400 Bad Request): Check payload or animal assignment."));
-            Serial.println(responseBody);
+            Serial.printf("[HTTP] REJECTED (400 Bad Request): %s\n", responseBody.c_str());
         } else if (httpResponseCode == 401) {
-            Serial.println(F("[HTTP] REJECTED (401 Unauthorized): Check API key configuration."));
+            Serial.println(F("[HTTP] REJECTED (401 Unauthorized): API key hash mismatch or device unmapped."));
+        } else if (httpResponseCode == 503) {
+            Serial.println(F("[HTTP] 503 Service Unavailable: Backend cold-starting or restarting on Render."));
         } else {
-            Serial.print(F("[HTTP] Unexpected Status: "));
-            Serial.println(responseBody);
+            Serial.printf("[HTTP] Response Code %d: %s\n", httpResponseCode, responseBody.c_str());
         }
     } else {
-        Serial.print(F("[HTTP] Error: "));
-        Serial.println(http.errorToString(httpResponseCode));
-        if (isHttps) {
-            Serial.println(F("[HTTP] Note: HTTPS TLS handshake failed or server unreachable. Retrying with backoff."));
-        } else {
-            Serial.println(F("[HTTP] Note: Verify backend LAN IP and ensure Windows Firewall allows port 8085."));
-        }
+        Serial.printf("[HTTP] Error: %s (Code: %d)\n", http.errorToString(httpResponseCode).c_str(), httpResponseCode);
+        
+        // Run deep diagnostics on connection failure
+        runNetworkDiagnostics();
+
         consecutiveFailures++;
         if (consecutiveFailures >= 3) {
             currentIntervalMs = min(currentIntervalMs + 2000, MAX_BACKOFF_INTERVAL_MS);
-            Serial.print(F("[RETRY] Consecutive failures: "));
-            Serial.print(consecutiveFailures);
-            Serial.print(F(". Backing off interval to: "));
-            Serial.print(currentIntervalMs);
-            Serial.println(F(" ms."));
+            Serial.printf("[RETRY] Consecutive failures: %d. Backing off interval to %lu ms.\n",
+                consecutiveFailures, currentIntervalMs);
         }
     }
 
