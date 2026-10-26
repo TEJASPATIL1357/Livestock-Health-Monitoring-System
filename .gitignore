@@ -57,6 +57,8 @@ target/
 **/target/
 *.class
 *.jar
+!gradle-wrapper.jar
+!**/gradle/wrapper/gradle-wrapper.jar
 *.war
 .flattened-pom.xml
 
